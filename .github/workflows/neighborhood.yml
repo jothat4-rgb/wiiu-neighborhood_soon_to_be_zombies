@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Download repository
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Install tools
         run: |
@@ -55,6 +57,20 @@ jobs:
             exit 1
           fi
 
+          echo "Checking optional scenery folders..."
+
+          if [ -d extracted/output/_assets/nature ]; then
+            echo "Nature assets folder found."
+          else
+            echo "WARNING: Nature assets folder missing. Nature overlay will be skipped."
+          fi
+
+          if [ -d extracted/output/_assets/roads ]; then
+            echo "Road assets folder found."
+          else
+            echo "WARNING: Road assets folder missing. Streetlights may be skipped."
+          fi
+
           echo "Archive extraction and file checks passed."
 
           echo "OBJ_PATH=extracted/output/neighborhood.obj" >> "$GITHUB_ENV"
@@ -66,8 +82,11 @@ jobs:
         run: |
           cat > render_preview.py <<'PY'
           import bpy
+          import math
           import os
-          from mathutils import Vector
+          import random
+          import glob
+          from mathutils import Matrix, Vector
 
           obj_path = os.environ["OBJ_PATH"]
 
@@ -131,7 +150,12 @@ jobs:
           scene.render.engine = "CYCLES"
           scene.cycles.device = "CPU"
           scene.cycles.samples = 64
-          scene.cycles.use_denoising = False
+          scene.cycles.use_denoising = True
+
+          try:
+              scene.cycles.denoiser = "OPENIMAGEDENOISE"
+          except Exception as exc:
+              print("Denoiser setting skipped:", exc)
 
           scene.render.resolution_x = 1280
           scene.render.resolution_y = 720
@@ -200,15 +224,329 @@ jobs:
 
           ground.data.materials.append(ground_mat)
 
+          # ---- Scenery overlay -------------------------------------
+          # Extra bushes, flowers, grass, rocks, trees and streetlights
+          # are added ON TOP of the map. The original neighborhood OBJ
+          # and MTL are never modified.
+          #
+          # IMPORTANT: Map classification happens BEFORE asset loading.
+          # Therefore, a missing scenery asset cannot break house detection
+          # or the building close-up previews.
+
+          def world_rect(obj):
+              pts = [
+                  obj.matrix_world @ Vector(c)
+                  for c in obj.bound_box
+              ]
+
+              return (
+                  min(p.x for p in pts), max(p.x for p in pts),
+                  min(p.y for p in pts), max(p.y for p in pts)
+              )
+
+          # Work out what is already occupied on the map.
+          house_rects = []
+          house_objects = []
+          road_rects = []
+          other_rects = []
+
+          for obj in meshes:
+              name = obj.name.lower()
+              rect = world_rect(obj)
+
+              if name.startswith("house"):
+                  house_rects.append(rect)
+                  house_objects.append(obj)
+              elif name.startswith(("road", "intersection")):
+                  road_rects.append(rect)
+              else:
+                  other_rects.append(rect)
+
+          blocked = house_rects + road_rects + other_rects
+
+          print("Recognized houses:", len(house_objects))
+          print("Recognized road objects:", len(road_rects))
+
+          x_min = minimum.x + 0.5
+          x_max = maximum.x - 0.5
+          y_min = minimum.y + 0.5
+          y_max = maximum.y - 0.5
+
+          assets_root = os.path.join(
+              os.path.dirname(obj_path), "_assets"
+          )
+
+          def import_obj_file(path):
+              if not os.path.isfile(path):
+                  raise FileNotFoundError(
+                      "Asset file not found: " + path
+                  )
+
+              before = set(bpy.data.objects)
+
+              if hasattr(bpy.ops.wm, "obj_import"):
+                  bpy.ops.wm.obj_import(filepath=path)
+              else:
+                  bpy.ops.import_scene.obj(filepath=path)
+
+              return [
+                  o for o in bpy.data.objects
+                  if o not in before and o.type == "MESH"
+              ]
+
+          def load_asset(rel_path, flat_color=None):
+              path = os.path.join(assets_root, rel_path)
+
+              parts = import_obj_file(path)
+
+              if not parts:
+                  print("WARNING: No mesh imported from:", rel_path)
+                  return []
+
+              if flat_color is not None:
+                  mat = bpy.data.materials.new("Flat_" + rel_path)
+                  mat.use_nodes = True
+                  shader = mat.node_tree.nodes.get("Principled BSDF")
+
+                  if shader:
+                      shader.inputs["Base Color"].default_value = (
+                          flat_color
+                      )
+
+                  for part in parts:
+                      part.data.materials.clear()
+                      part.data.materials.append(mat)
+
+              # The originals are hidden; only the copies get rendered.
+              for part in parts:
+                  part.hide_render = True
+                  part.hide_viewport = True
+
+              return parts
+
+          # Each asset is loaded independently.
+          # One missing filename will not cancel the other scenery.
+          def safe_load_asset(rel_path, flat_color=None):
+              try:
+                  result = load_asset(rel_path, flat_color)
+                  print("Loaded scenery asset:", rel_path)
+                  return result
+              except Exception as exc:
+                  print(
+                      "WARNING: Skipping scenery asset:",
+                      rel_path,
+                      "-",
+                      exc
+                  )
+                  return []
+
+          def place(parts, x, y, scale, rot_z=0.0):
+              if not parts:
+                  return
+
+              base = (
+                  Matrix.Translation((x, y, minimum.z))
+                  @ Matrix.Rotation(rot_z, 4, "Z")
+                  @ Matrix.Scale(scale, 4)
+              )
+
+              for part in parts:
+                  copy = part.copy()
+                  copy.hide_render = False
+                  copy.hide_viewport = False
+                  scene.collection.objects.link(copy)
+                  copy.matrix_world = base @ part.matrix_world
+
+          def is_free(x, y, margin):
+              if not (
+                  x_min <= x <= x_max
+                  and y_min <= y <= y_max
+              ):
+                  return False
+
+              for x0, x1, y0, y1 in blocked:
+                  if (
+                      x0 - margin <= x <= x1 + margin
+                      and y0 - margin <= y <= y1 + margin
+                  ):
+                      return False
+
+              return True
+
+          def scatter_near(rect, choices, count, scales, spread):
+              choices = [choice for choice in choices if choice]
+
+              if not choices:
+                  return
+
+              x0, x1, y0, y1 = rect
+              placed = 0
+              attempts = 0
+
+              while placed < count and attempts < count * 8:
+                  attempts += 1
+                  x = random.uniform(x0 - spread, x1 + spread)
+                  y = random.uniform(y0 - spread, y1 + spread)
+
+                  if not is_free(x, y, 0.2):
+                      continue
+
+                  place(
+                      random.choice(choices),
+                      x, y,
+                      random.uniform(*scales),
+                      random.uniform(0, 2 * math.pi)
+                  )
+                  placed += 1
+
+          try:
+              nature = "nature/Models/OBJ format/"
+
+              bushes = [
+                  safe_load_asset(nature + n + ".obj") for n in (
+                      "plant_bush", "plant_bushLarge",
+                      "plant_bushSmall", "plant_bushDetailed"
+                  )
+              ]
+              bushes = [asset for asset in bushes if asset]
+
+              flowers = [
+                  safe_load_asset(nature + n + ".obj") for n in (
+                      "flower_redA", "flower_redB",
+                      "flower_yellowA", "flower_yellowB",
+                      "flower_purpleA", "flower_purpleB"
+                  )
+              ]
+              flowers = [asset for asset in flowers if asset]
+
+              grasses = [
+                  safe_load_asset(nature + n + ".obj") for n in (
+                      "grass", "grass_large"
+                  )
+              ]
+              grasses = [asset for asset in grasses if asset]
+
+              rocks = [
+                  safe_load_asset(nature + n + ".obj") for n in (
+                      "rock_smallA", "stone_smallB",
+                      "rock_smallFlatA"
+                  )
+              ]
+              rocks = [asset for asset in rocks if asset]
+
+              extra_trees = [
+                  safe_load_asset(nature + n + ".obj") for n in (
+                      "tree_default", "tree_oak",
+                      "tree_pineRoundA", "tree_simple"
+                  )
+              ]
+              extra_trees = [
+                  asset for asset in extra_trees if asset
+              ]
+
+              streetlight = safe_load_asset(
+                  "roads/Models/OBJ format/light-curved.obj",
+                  flat_color=(0.35, 0.37, 0.40, 1)
+              )
+
+              bpy.context.view_layer.update()
+
+              random.seed(7)
+
+              # Yards: bushes, flowers and grass around every house.
+              for rect in house_rects:
+                  scatter_near(
+                      rect, bushes, 4, (2.0, 2.8), 0.9
+                  )
+                  scatter_near(
+                      rect, flowers, 5, (2.5, 3.5), 1.0
+                  )
+                  scatter_near(
+                      rect, grasses, 8, (1.8, 2.6), 2.4
+                  )
+
+              # A few rocks and extra trees in open ground.
+              decoration_choices = extra_trees + rocks
+              extra_count = 0
+              attempts = 0
+
+              while (
+                  decoration_choices
+                  and extra_count < 40
+                  and attempts < 600
+              ):
+                  attempts += 1
+                  x = random.uniform(x_min, x_max)
+                  y = random.uniform(y_min, y_max)
+
+                  if not is_free(x, y, 1.2):
+                      continue
+
+                  if extra_trees and (
+                      not rocks or extra_count % 3 == 0
+                  ):
+                      place(
+                          random.choice(extra_trees),
+                          x, y,
+                          random.uniform(0.8, 1.0),
+                          random.uniform(0, 2 * math.pi)
+                      )
+                  elif rocks:
+                      place(
+                          random.choice(rocks),
+                          x, y,
+                          random.uniform(1.5, 2.5),
+                          random.uniform(0, 2 * math.pi)
+                      )
+
+                  extra_count += 1
+
+              # Streetlights beside the two long horizontal roads.
+              row_counts = {}
+
+              for x0, x1, y0, y1 in road_rects:
+                  cy = round((y0 + y1) / 2 * 2) / 2
+                  row_counts[cy] = row_counts.get(cy, 0) + 1
+
+              road_lines = [
+                  cy for cy, n in row_counts.items() if n >= 20
+              ]
+
+              for cy in road_lines:
+                  for x in (-24, -12, 12, 24):
+                      # Do not place lights beyond the neighborhood.
+                      if not (x_min <= x <= x_max):
+                          continue
+
+                      for side in (1.0, -1.0):
+                          py = cy + side
+
+                          if not (y_min <= py <= y_max):
+                              continue
+
+                          rot = math.pi if side > 0 else 0.0
+                          place(streetlight, x, py, 2.5, rot)
+
+              print("Scenery overlay completed.")
+
+          except Exception as exc:
+              print("Scenery overlay skipped:", exc)
+
+          # ---- Camera setup ----------------------------------------
+
           # Camera helper. The up axis is always the string "Y".
-          def create_camera(name, location):
+          # An optional target lets us aim at individual buildings.
+          def create_camera(name, location, target=None):
               bpy.ops.object.camera_add(location=location)
 
               camera = bpy.context.object
               camera.name = name
 
+              if target is None:
+                  target = center
+
               camera.rotation_euler = (
-                  center - camera.location
+                  target - camera.location
               ).to_track_quat("-Z", "Y").to_euler()
 
               camera.data.clip_start = 0.1
@@ -268,11 +606,94 @@ jobs:
 
           bpy.ops.render.render(write_still=True)
 
-          # Verify that both preview images were created.
+          # IMAGES 3-7: Five randomly selected building close-ups.
+          print("Selecting random buildings for close-up previews...")
+
+          if len(house_objects) == 0:
+              print(
+                  "WARNING: No house objects were recognized. "
+                  "No building close-ups will be created."
+              )
+          else:
+              selected_buildings = random.SystemRandom().sample(
+                  house_objects,
+                  min(5, len(house_objects))
+              )
+
+              for index, building in enumerate(
+                  selected_buildings, start=1
+              ):
+
+                  building_corners = [
+                      building.matrix_world @ Vector(corner)
+                      for corner in building.bound_box
+                  ]
+
+                  building_min = Vector((
+                      min(v.x for v in building_corners),
+                      min(v.y for v in building_corners),
+                      min(v.z for v in building_corners)
+                  ))
+
+                  building_max = Vector((
+                      max(v.x for v in building_corners),
+                      max(v.y for v in building_corners),
+                      max(v.z for v in building_corners)
+                  ))
+
+                  building_center = (
+                      building_min + building_max
+                  ) / 2
+
+                  building_size = max(
+                      building_max.x - building_min.x,
+                      building_max.y - building_min.y,
+                      building_max.z - building_min.z
+                  )
+
+                  distance = max(building_size * 2.5, 3.0)
+
+                  camera_location = building_center + Vector((
+                      distance * 1.1,
+                      -distance * 1.4,
+                      distance * 0.9
+                  ))
+
+                  camera = create_camera(
+                      "BuildingCloseup_" + str(index),
+                      camera_location,
+                      building_center
+                  )
+
+                  camera.data.type = "PERSP"
+                  camera.data.lens = 50
+
+                  scene.render.filepath = (
+                      "previews/building_closeup_"
+                      + str(index) + ".png"
+                  )
+
+                  print(
+                      "Rendering building",
+                      index,
+                      "of",
+                      min(5, len(house_objects)),
+                      building.name
+                  )
+
+                  bpy.ops.render.render(write_still=True)
+
+              print("Random building close-ups completed.")
+
+          # Verify every preview image that was created.
           output_files = [
               "previews/neighborhood_overhead.png",
               "previews/neighborhood_3d.png"
           ]
+
+          output_files.extend(
+              glob.glob("previews/building_closeup_*.png")
+          )
 
           for path in output_files:
               if not os.path.isfile(path):
@@ -293,7 +714,9 @@ jobs:
               )
 
           print("Imported mesh objects:", len(meshes))
-          print("Both neighborhood previews completed successfully.")
+          print("Recognized house objects:", len(house_objects))
+          print("Total preview images:", len(output_files))
+          print("Neighborhood preview rendering completed.")
           PY
 
       - name: Render neighborhood previews
