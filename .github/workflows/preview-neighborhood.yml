@@ -1,0 +1,184 @@
+name: Preview Neighborhood
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip blender
+
+      - name: Extract neighborhood archive
+        run: |
+          mkdir -p extracted
+
+          unzip -t mygamefiles.zip
+          unzip -q mygamefiles.zip -d extracted
+
+      - name: Locate neighborhood OBJ
+        run: |
+          OBJ=$(find extracted -type f -name neighborhood.obj | head -n 1)
+
+          if [ -z "$OBJ" ]; then
+            echo "ERROR: neighborhood.obj was not found."
+            exit 1
+          fi
+
+          echo "OBJ_PATH=$OBJ" >> "$GITHUB_ENV"
+          echo "Found neighborhood: $OBJ"
+
+      - name: Create preview renderer
+        run: |
+          cat > render_preview.py <<'PY'
+          import bpy
+          import os
+          from mathutils import Vector
+
+          obj_path = os.environ["OBJ_PATH"]
+
+          bpy.ops.wm.read_factory_settings(use_empty=True)
+
+          if hasattr(bpy.ops.wm, "obj_import"):
+              bpy.ops.wm.obj_import(filepath=obj_path)
+          else:
+              bpy.ops.import_scene.obj(filepath=obj_path)
+
+          meshes = [
+              obj for obj in bpy.context.scene.objects
+              if obj.type == "MESH"
+          ]
+
+          if not meshes:
+              raise RuntimeError("No mesh objects were imported.")
+
+          bpy.context.view_layer.update()
+
+          corners = [
+              obj.matrix_world @ Vector(corner)
+              for obj in meshes
+              for corner in obj.bound_box
+          ]
+
+          minimum = Vector((
+              min(v.x for v in corners),
+              min(v.y for v in corners),
+              min(v.z for v in corners)
+          ))
+
+          maximum = Vector((
+              max(v.x for v in corners),
+              max(v.y for v in corners),
+              max(v.z for v in corners)
+          ))
+
+          center = (minimum + maximum) / 2
+
+          size = max(
+              maximum.x - minimum.x,
+              maximum.y - minimum.y,
+              maximum.z - minimum.z
+          )
+
+          if size <= 0:
+              raise RuntimeError("Invalid neighborhood dimensions.")
+
+          scene = bpy.context.scene
+          scene.render.engine = "BLENDER_EEVEE"
+          scene.eevee.taa_render_samples = 16
+          scene.render.resolution_x = 1280
+          scene.render.resolution_y = 720
+          scene.render.resolution_percentage = 100
+          scene.render.image_settings.file_format = "PNG"
+          scene.render.film_transparent = False
+          scene.world.color = (0.12, 0.12, 0.12)
+
+          bpy.ops.object.light_add(
+              type="AREA",
+              location=center + Vector((size, size * 1.5, size))
+          )
+
+          light = bpy.context.object
+          light.data.energy = 4500
+          light.data.shape = "DISK"
+          light.data.size = size
+
+          light.rotation_euler = (
+              center - light.location
+          ).to_track_quat("-Z", "Y").to_euler()
+
+          def create_camera(name, location, up):
+              bpy.ops.object.camera_add(location=location)
+
+              camera = bpy.context.object
+              camera.name = name
+
+              camera.rotation_euler = (
+                  center - camera.location
+              ).to_track_quat("-Z", up).to_euler()
+
+              scene.camera = camera
+              return camera
+
+          os.makedirs("previews", exist_ok=True)
+
+          # OVERHEAD PREVIEW
+          camera = create_camera(
+              "OverheadCamera",
+              center + Vector((0, size * 2.2, 0)),
+              "Z"
+          )
+
+          camera.data.type = "ORTHO"
+          camera.data.ortho_scale = size * 1.25
+
+          scene.render.filepath = (
+              "previews/neighborhood_overhead.png"
+          )
+
+          bpy.ops.render.render(write_still=True)
+
+          # ANGLED 3D PREVIEW
+          camera = create_camera(
+              "AngledCamera",
+              center + Vector((
+                  size * 0.9,
+                  size * 1.05,
+                  size * 1.15
+              )),
+              "Y"
+          )
+
+          camera.data.type = "PERSP"
+          camera.data.lens = 42
+
+          scene.render.filepath = (
+              "previews/neighborhood_3d.png"
+          )
+
+          bpy.ops.render.render(write_still=True)
+
+          print("Imported mesh objects:", len(meshes))
+          print("Minimum bounds:", tuple(minimum))
+          print("Maximum bounds:", tuple(maximum))
+          print("Both preview images rendered successfully.")
+          PY
+
+      - name: Render neighborhood previews
+        run: |
+          blender -b -t 2 --python render_preview.py
+
+      - name: Upload preview images
+        uses: actions/upload-artifact@v4
+        with:
+          name: neighborhood-preview-images
+          path: previews/*.png
+          if-no-files-found: error
+          retention-days: 14
