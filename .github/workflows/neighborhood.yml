@@ -207,13 +207,24 @@ jobs:
           scene = bpy.context.scene
           scene.render.engine = "CYCLES"
           scene.cycles.device = "CPU"
+          # Ubuntu's Blender package is built WITHOUT OpenImageDenoise.
+          # Only enable denoising if it is really available; otherwise
+          # turn it off and use more samples to keep the image clean.
           scene.cycles.samples = 64
-          scene.cycles.use_denoising = True
+          scene.cycles.use_denoising = False
 
           try:
               scene.cycles.denoiser = "OPENIMAGEDENOISE"
+              scene.cycles.use_denoising = True
+              print("OpenImageDenoise enabled.")
           except Exception as exc:
-              print("Denoiser setting skipped:", exc)
+              scene.cycles.use_denoising = False
+              scene.cycles.samples = 128
+              print(
+                  "OpenImageDenoise unavailable. "
+                  "Denoising disabled, samples raised to 128:",
+                  exc
+              )
 
           scene.render.resolution_x = 1280
           scene.render.resolution_y = 720
