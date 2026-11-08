@@ -1,0 +1,128 @@
+name: Inspect Neighborhood Assets
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "mygamefiles.zip"
+      - ".github/workflows/inspect-assets.yml"
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository files
+        uses: actions/checkout@v4
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip p7zip-full
+
+      - name: Extract neighborhood archive
+        run: |
+          mkdir -p extracted
+          if unzip -t mygamefiles.zip; then
+            unzip -q mygamefiles.zip -d extracted
+          elif 7z t mygamefiles.zip; then
+            7z x mygamefiles.zip -oextracted -y
+          else
+            echo "ERROR: Archive is not a valid ZIP or 7z archive."
+            exit 1
+          fi
+
+      - name: Find neighborhood files
+        run: |
+          echo "=== Main files ==="
+          find extracted -type f \( \
+            -name "neighborhood.obj" -o \
+            -name "neighborhood.mtl" -o \
+            -name "doors.json" -o \
+            -name "objects.json" \
+          \)
+
+          echo "=== Asset folders ==="
+          find extracted -type d \( \
+            -name "roads" -o \
+            -name "suburban" -o \
+            -name "nature" -o \
+            -name "textures" \
+          )
+
+      - name: Validate required files
+        run: |
+          OBJ=$(find extracted -type f -name neighborhood.obj | head -n 1)
+          MTL=$(find extracted -type f -name neighborhood.mtl | head -n 1)
+          DOORS=$(find extracted -type f -name doors.json | head -n 1)
+          OBJECTS=$(find extracted -type f -name objects.json | head -n 1)
+
+          for ITEM in OBJ MTL DOORS OBJECTS; do
+            eval "VALUE=\$$ITEM"
+            if [ -z "$VALUE" ]; then
+              echo "ERROR: Missing $ITEM"
+              exit 1
+            fi
+            echo "FOUND $ITEM: $VALUE"
+          done
+
+      - name: Count files and textures
+        run: |
+          echo "Total files:"
+          find extracted -type f | wc -l
+
+          echo "PNG textures:"
+          find extracted -type f -iname "*.png" | wc -l
+
+          echo "OBJ models:"
+          find extracted -type f -iname "*.obj" | wc -l
+
+      - name: Check MTL texture references
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          root = "extracted"
+          mtl = next(
+              os.path.join(base, name)
+              for base, _, files in os.walk(root)
+              for name in files
+              if name == "neighborhood.mtl"
+          )
+
+          missing = []
+          checked = 0
+
+          with open(mtl, encoding="utf-8", errors="replace") as f:
+              for line in f:
+                  parts = line.strip().split(maxsplit=1)
+                  if len(parts) != 2:
+                      continue
+                  if parts[0] not in (
+                      "map_Ka", "map_Kd", "map_Ks",
+                      "map_Ke", "map_Bump", "bump"
+                  ):
+                      continue
+
+                  texture = parts[1].strip().strip('"')
+                  path = os.path.normpath(
+                      os.path.join(os.path.dirname(mtl), texture)
+                  )
+                  checked += 1
+
+                  if not os.path.isfile(path):
+                      missing.append((texture, path))
+
+          print("MTL:", mtl)
+          print("Texture references checked:", checked)
+          print("Missing texture references:", len(missing))
+
+          for texture, path in missing[:50]:
+              print("MISSING:", texture, "->", path)
+
+          if missing:
+              raise SystemExit("ERROR: Some referenced textures are missing.")
+
+          print("All referenced textures were found.")
+          PY
