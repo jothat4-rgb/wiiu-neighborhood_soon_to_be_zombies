@@ -26,7 +26,12 @@ jobs:
           sudo apt-get install -y blender p7zip-full
 
       - name: Check and extract neighborhood archive
+        id: extract
+        shell: bash
         run: |
+          mkdir -p diagnostics
+          exec > >(tee diagnostics/extract.log) 2>&1
+
           if [ ! -f mygamefiles.zip ]; then
             echo "ERROR: mygamefiles.zip is missing from repository root."
             exit 1
@@ -86,7 +91,53 @@ jobs:
           import os
           import random
           import glob
+          import sys
+          import traceback
           from mathutils import Matrix, Vector
+
+          # If anything crashes, write a readable error file that the
+          # workflow uploads as the "neighborhood-error-report" artifact.
+          def _report_failure(exc_type, exc, tb):
+              try:
+                  os.makedirs("diagnostics", exist_ok=True)
+                  g = globals()
+
+                  with open("diagnostics/python_error.txt", "w") as f:
+                      f.write("Python error in render_preview.py\n\n")
+                      f.write(
+                          "".join(
+                              traceback.format_exception(
+                                  exc_type, exc, tb
+                              )
+                          )
+                      )
+                      f.write("\nContext:\n")
+                      f.write("OBJ_PATH: " + str(g.get("obj_path")) + "\n")
+
+                      m = g.get("meshes")
+
+                      if m is not None:
+                          f.write(
+                              "Mesh objects imported: "
+                              + str(len(m)) + "\n"
+                          )
+
+                          for o in m[:50]:
+                              f.write("  - " + o.name + "\n")
+
+                      h = g.get("house_objects")
+
+                      if h is not None:
+                          f.write(
+                              "Recognized houses: "
+                              + str(len(h)) + "\n"
+                          )
+              except Exception:
+                  pass
+
+              sys.__excepthook__(exc_type, exc, tb)
+
+          sys.excepthook = _report_failure
 
           obj_path = os.environ["OBJ_PATH"]
 
@@ -110,6 +161,13 @@ jobs:
               raise RuntimeError("No mesh objects were imported.")
 
           bpy.context.view_layer.update()
+
+          print("Imported object names (first 50):")
+
+          for o in meshes[:50]:
+              print(" -", o.name)
+
+          print("Total meshes:", len(meshes))
 
           # Calculate the complete imported neighborhood bounds.
           corners = [
@@ -329,7 +387,10 @@ jobs:
           def safe_load_asset(rel_path, flat_color=None):
               try:
                   result = load_asset(rel_path, flat_color)
-                  print("Loaded scenery asset:", rel_path)
+
+                  if result:
+                      print("Loaded scenery asset:", rel_path)
+
                   return result
               except Exception as exc:
                   print(
@@ -720,8 +781,11 @@ jobs:
           PY
 
       - name: Render neighborhood previews
+        id: render
+        shell: bash
         run: |
-          blender -b -t 2 --python-exit-code 1 --python render_preview.py
+          mkdir -p diagnostics
+          blender -b -t 2 --python-exit-code 1 --python render_preview.py 2>&1 | tee diagnostics/render.log
 
       - name: Upload preview images
         uses: actions/upload-artifact@v4
@@ -729,4 +793,78 @@ jobs:
           name: neighborhood-preview-images
           path: previews/*.png
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Build error report
+        if: failure()
+        shell: bash
+        env:
+          EXTRACT_OUTCOME: ${{ steps.extract.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+        run: |
+          mkdir -p diagnostics
+          R=diagnostics/ERROR_REPORT.txt
+          E=diagnostics/extract.log
+          B=diagnostics/render.log
+          touch "$E" "$B"
+
+          {
+            echo "NEIGHBORHOOD PREVIEW - ERROR REPORT"
+            echo "Run:    $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo "Extract step: $EXTRACT_OUTCOME"
+            echo "Render step:  $RENDER_OUTCOME"
+            echo
+            echo "== LIKELY CAUSE =="
+
+            if grep -q "is missing from repository root" "$E"; then
+              echo "mygamefiles.zip was not found at the repo root (or the LFS file was not pulled)."
+            elif grep -q "was not found" "$E"; then
+              echo "A required file or folder is missing inside the zip. Check for an extra top-level folder."
+            elif grep -qiE "can not open|cannot open|data error|is not archive" "$E"; then
+              echo "The archive could not be read. It may be corrupt or an LFS pointer file."
+            elif grep -q "No mesh objects were imported" "$B"; then
+              echo "The OBJ loaded but contained no meshes."
+            elif grep -q "importer is unavailable" "$B"; then
+              echo "This Blender version has no OBJ importer."
+            elif grep -q "Traceback" "$B"; then
+              echo "A Python error occurred in render_preview.py. See the traceback below."
+            elif grep -qiE "killed|out of memory|cannot allocate" "$B"; then
+              echo "The runner ran out of memory or time. Try lowering samples or resolution."
+            elif [ "$EXTRACT_OUTCOME" != "failure" ] && [ "$RENDER_OUTCOME" != "failure" ]; then
+              echo "An earlier step failed (checkout, install tools, or renderer creation), or a later step failed. See the run link above."
+            else
+              echo "Unknown. Read the logs below."
+            fi
+
+            echo
+            echo "== PYTHON TRACEBACK =="
+
+            if [ -f diagnostics/python_error.txt ]; then
+              cat diagnostics/python_error.txt
+            else
+              grep -A20 "Traceback" "$B" || echo "(none found)"
+            fi
+
+            echo
+            echo "== MAP RECOGNITION =="
+            grep -E "Recognized|Neighborhood (width|depth|height)|Skipping scenery|WARNING|Total meshes" "$B" || echo "(none)"
+
+            echo
+            echo "== LAST 60 LINES OF EXTRACT LOG =="
+            tail -n 60 "$E"
+
+            echo
+            echo "== LAST 60 LINES OF RENDER LOG =="
+            tail -n 60 "$B"
+          } > "$R"
+
+      - name: Upload error report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neighborhood-error-report
+          path: diagnostics/
+          if-no-files-found: warn
           retention-days: 14
