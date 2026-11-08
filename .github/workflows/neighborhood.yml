@@ -1,0 +1,275 @@
+name: Preview Neighborhood
+
+on:
+  push:
+    paths:
+      - 'mygamefiles.zip'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y blender p7zip-full
+
+      - name: Check and extract neighborhood archive
+        run: |
+          if [ ! -f mygamefiles.zip ]; then
+            echo "ERROR: mygamefiles.zip is missing from repository root."
+            exit 1
+          fi
+
+          mkdir -p extracted
+
+          echo "Testing archive..."
+          7z t mygamefiles.zip
+
+          echo "Extracting archive..."
+          7z x -y -oextracted mygamefiles.zip
+
+          echo "Checking required files..."
+
+          if [ ! -f extracted/output/neighborhood.obj ]; then
+            echo "ERROR: output/neighborhood.obj was not found."
+            exit 1
+          fi
+
+          if [ ! -f extracted/output/neighborhood.mtl ]; then
+            echo "ERROR: output/neighborhood.mtl was not found."
+            exit 1
+          fi
+
+          if [ ! -d extracted/output/textures ]; then
+            echo "ERROR: output/textures folder was not found."
+            exit 1
+          fi
+
+          echo "Archive extraction and file checks passed."
+
+          echo "OBJ_PATH=extracted/output/neighborhood.obj" >> "$GITHUB_ENV"
+
+          echo "PNG texture count:"
+          find extracted/output/textures -type f -iname '*.png' | wc -l
+
+      - name: Create preview renderer
+        run: |
+          cat > render_preview.py <<'PY'
+          import bpy
+          import os
+          from mathutils import Vector
+
+          obj_path = os.environ["OBJ_PATH"]
+
+          # Start with a clean Blender scene.
+          bpy.ops.wm.read_factory_settings(use_empty=True)
+
+          # Import OBJ using the available Blender importer.
+          if hasattr(bpy.ops.wm, "obj_import"):
+              bpy.ops.wm.obj_import(filepath=obj_path)
+          elif hasattr(bpy.ops.import_scene, "obj"):
+              bpy.ops.import_scene.obj(filepath=obj_path)
+          else:
+              raise RuntimeError("Blender OBJ importer is unavailable.")
+
+          meshes = [
+              obj for obj in bpy.context.scene.objects
+              if obj.type == "MESH"
+          ]
+
+          if not meshes:
+              raise RuntimeError("No mesh objects were imported.")
+
+          bpy.context.view_layer.update()
+
+          # Calculate the complete imported neighborhood bounds.
+          corners = [
+              obj.matrix_world @ Vector(corner)
+              for obj in meshes
+              for corner in obj.bound_box
+          ]
+
+          minimum = Vector((
+              min(v.x for v in corners),
+              min(v.y for v in corners),
+              min(v.z for v in corners)
+          ))
+
+          maximum = Vector((
+              max(v.x for v in corners),
+              max(v.y for v in corners),
+              max(v.z for v in corners)
+          ))
+
+          center = (minimum + maximum) / 2
+
+          width = maximum.x - minimum.x
+          depth = maximum.y - minimum.y
+          height = maximum.z - minimum.z
+
+          size = max(width, depth, height)
+
+          if size <= 0:
+              raise RuntimeError("Invalid neighborhood dimensions.")
+
+          print("Neighborhood width:", width)
+          print("Neighborhood depth:", depth)
+          print("Neighborhood height:", height)
+
+          # Configure CPU rendering with Cycles.
+          scene = bpy.context.scene
+          scene.render.engine = "CYCLES"
+          scene.cycles.device = "CPU"
+          scene.cycles.samples = 32
+          scene.cycles.use_denoising = False
+
+          scene.render.resolution_x = 1280
+          scene.render.resolution_y = 720
+          scene.render.resolution_percentage = 100
+          scene.render.image_settings.file_format = "PNG"
+          scene.render.film_transparent = False
+
+          # Create a world background.
+          if scene.world is None:
+              scene.world = bpy.data.worlds.new("PreviewWorld")
+
+          scene.world.use_nodes = True
+          background = scene.world.node_tree.nodes.get("Background")
+
+          if background:
+              background.inputs["Color"].default_value = (
+                  0.12, 0.12, 0.12, 1
+              )
+              background.inputs["Strength"].default_value = 0.8
+
+          # Add a Sun light instead of a powerful area light.
+          bpy.ops.object.light_add(
+              type="SUN",
+              location=center + Vector((size, -size, size * 2))
+          )
+
+          light = bpy.context.object
+          light.name = "NeighborhoodSun"
+          light.data.energy = 4
+
+          light.rotation_euler = (
+              center - light.location
+          ).to_track_quat("-Z", "Y").to_euler()
+
+          # Camera helper. The up axis is always the string "Y".
+          def create_camera(name, location):
+              bpy.ops.object.camera_add(location=location)
+
+              camera = bpy.context.object
+              camera.name = name
+
+              camera.rotation_euler = (
+                  center - camera.location
+              ).to_track_quat("-Z", "Y").to_euler()
+
+              camera.data.clip_start = 0.1
+              camera.data.clip_end = size * 10
+
+              scene.camera = camera
+              return camera
+
+          os.makedirs("previews", exist_ok=True)
+
+          # IMAGE 1: Overhead map view.
+          overhead = create_camera(
+              "OverheadCamera",
+              Vector((
+                  center.x,
+                  center.y,
+                  maximum.z + size
+              ))
+          )
+
+          overhead.rotation_euler = (0, 0, 0)
+          overhead.data.type = "ORTHO"
+
+          # Fit both map dimensions into the landscape image.
+          aspect_ratio = (
+              scene.render.resolution_x /
+              scene.render.resolution_y
+          )
+
+          overhead.data.ortho_scale = max(
+              width,
+              depth * aspect_ratio
+          ) * 1.10
+
+          scene.render.filepath = (
+              "previews/neighborhood_overhead.png"
+          )
+
+          bpy.ops.render.render(write_still=True)
+
+          # IMAGE 2: Angled 3D neighborhood view.
+          angled = create_camera(
+              "AngledCamera",
+              center + Vector((
+                  size * 0.9,
+                  -size * 1.05,
+                  size * 0.9
+              ))
+          )
+
+          angled.data.type = "PERSP"
+          angled.data.lens = 42
+
+          scene.render.filepath = (
+              "previews/neighborhood_3d.png"
+          )
+
+          bpy.ops.render.render(write_still=True)
+
+          # Verify that both preview images were created.
+          output_files = [
+              "previews/neighborhood_overhead.png",
+              "previews/neighborhood_3d.png"
+          ]
+
+          for path in output_files:
+              if not os.path.isfile(path):
+                  raise RuntimeError(
+                      "Missing preview image: " + path
+                  )
+
+              if os.path.getsize(path) == 0:
+                  raise RuntimeError(
+                      "Empty preview image: " + path
+                  )
+
+              print(
+                  "Created:",
+                  path,
+                  os.path.getsize(path),
+                  "bytes"
+              )
+
+          print("Imported mesh objects:", len(meshes))
+          print("Both neighborhood previews completed successfully.")
+          PY
+
+      - name: Render neighborhood previews
+        run: |
+          blender -b -t 2 --python-exit-code 1 --python render_preview.py
+
+      - name: Upload preview images
+        uses: actions/upload-artifact@v4
+        with:
+          name: neighborhood-preview-images
+          path: previews/*.png
+          if-no-files-found: error
+          retention-days: 14
