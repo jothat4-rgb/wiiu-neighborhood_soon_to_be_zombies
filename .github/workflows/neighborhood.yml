@@ -130,7 +130,7 @@ jobs:
           scene = bpy.context.scene
           scene.render.engine = "CYCLES"
           scene.cycles.device = "CPU"
-          scene.cycles.samples = 32
+          scene.cycles.samples = 64
           scene.cycles.use_denoising = False
 
           scene.render.resolution_x = 1280
@@ -148,9 +148,9 @@ jobs:
 
           if background:
               background.inputs["Color"].default_value = (
-                  0.12, 0.12, 0.12, 1
+                  0.55, 0.65, 0.80, 1
               )
-              background.inputs["Strength"].default_value = 0.8
+              background.inputs["Strength"].default_value = 1.5
 
           # Add a Sun light instead of a powerful area light.
           bpy.ops.object.light_add(
@@ -160,11 +160,45 @@ jobs:
 
           light = bpy.context.object
           light.name = "NeighborhoodSun"
-          light.data.energy = 4
+          light.data.energy = 5
 
           light.rotation_euler = (
               center - light.location
           ).to_track_quat("-Z", "Y").to_euler()
+
+          # Fill light from the opposite side so walls are not black.
+          bpy.ops.object.light_add(
+              type="SUN",
+              location=center + Vector((-size, size, size * 2))
+          )
+
+          fill = bpy.context.object
+          fill.name = "NeighborhoodFill"
+          fill.data.energy = 2
+
+          fill.rotation_euler = (
+              center - fill.location
+          ).to_track_quat("-Z", "Y").to_euler()
+
+          # Simple ground plane under the neighborhood.
+          bpy.ops.mesh.primitive_plane_add(
+              size=size * 3,
+              location=(center.x, center.y, minimum.z - 0.05)
+          )
+
+          ground = bpy.context.object
+          ground.name = "Ground"
+
+          ground_mat = bpy.data.materials.new("GroundMaterial")
+          ground_mat.use_nodes = True
+          bsdf = ground_mat.node_tree.nodes.get("Principled BSDF")
+
+          if bsdf:
+              bsdf.inputs["Base Color"].default_value = (
+                  0.25, 0.45, 0.20, 1
+              )
+
+          ground.data.materials.append(ground_mat)
 
           # Camera helper. The up axis is always the string "Y".
           def create_camera(name, location):
